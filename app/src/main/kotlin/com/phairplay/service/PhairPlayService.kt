@@ -7,6 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -22,13 +26,17 @@ import com.phairplay.settings.SettingsRepository
 import com.phairplay.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * PhairPlayService — Android ForegroundService that hosts all receiver protocols.
@@ -57,6 +65,18 @@ class PhairPlayService : Service() {
     // Coroutine scope — cancelled in onDestroy() to clean up all coroutines
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
+    private val receiverMutex = Mutex()
+
+    // Network recovery is owned by the foreground service so it continues working while the
+    // Activity is not open. A short debounce avoids tearing down the receiver during a normal
+    // Wi-Fi handoff between access points.
+    private val connectivityManager by lazy {
+        getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    }
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkRecoveryJob: Job? = null
+    @Volatile private var receiverRunRequested = false
+    @Volatile private var waitingForNetwork = false
 
     // Observable state — Activities and Fragments observe this via the binder
     private val _serviceState = MutableStateFlow<ServiceState>(ServiceState.Stopped)
@@ -105,6 +125,7 @@ class PhairPlayService : Service() {
         Logger.i("PhairPlayService created")
         settingsRepository = SettingsRepository(applicationContext)
         createNotificationChannel()
+        registerNetworkMonitoring()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -112,10 +133,35 @@ class PhairPlayService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification(isRunning = false))
 
         when (intent?.action) {
-            ACTION_START   -> serviceScope.launch { startReceivers() }
-            ACTION_STOP    -> serviceScope.launch { stopReceivers(); stopSelf() }
-            ACTION_RESTART -> serviceScope.launch { restartReceivers() }
-            else           -> serviceScope.launch { startReceivers() } // default: start
+            ACTION_START   -> {
+                receiverRunRequested = true
+                serviceScope.launch {
+                    receiverMutex.withLock { startReceivers() }
+                }
+            }
+            ACTION_STOP    -> {
+                receiverRunRequested = false
+                waitingForNetwork = false
+                networkRecoveryJob?.cancel()
+                serviceScope.launch {
+                    receiverMutex.withLock { stopReceivers() }
+                    stopSelf()
+                }
+            }
+            ACTION_RESTART -> {
+                receiverRunRequested = true
+                serviceScope.launch {
+                    receiverMutex.withLock { restartReceivers() }
+                }
+            }
+            else           -> {
+                // START_STICKY restarts arrive with a null intent. Recreate the receivers so the
+                // device is available again without requiring the user to open the UI.
+                receiverRunRequested = true
+                serviceScope.launch {
+                    receiverMutex.withLock { startReceivers() }
+                }
+            }
         }
 
         // START_STICKY: if the system kills the service, restart it with a null intent
@@ -125,14 +171,13 @@ class PhairPlayService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     /**
-     * The app was swiped away from recents. Cleanly stop all receivers (which closes the RTSP
-     * connection so an active mirror ends on the sender too) and stop the service — don't let
-     * START_STICKY silently resurrect it as a zombie that keeps advertising/streaming invisibly.
+     * The Activity task was removed from recents. Keep the foreground receiver alive so the TV
+     * remains discoverable and can accept a new share without reopening the app.
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Logger.i("App task removed — stopping receivers + service")
-        stopReceivers()
-        stopSelf()
+        // Keep the foreground receiver alive when the launcher removes the Activity task. The
+        // persistent notification and explicit Stop action are the user-visible lifecycle controls.
+        Logger.i("App task removed — keeping PhairPlayService alive")
         super.onTaskRemoved(rootIntent)
     }
 
@@ -163,6 +208,8 @@ class PhairPlayService : Service() {
 
     override fun onDestroy() {
         Logger.i("PhairPlayService destroying")
+        networkRecoveryJob?.cancel()
+        unregisterNetworkMonitoring()
         stopAllReceiversInternal()
         serviceJob.cancel()
         super.onDestroy()
@@ -177,6 +224,18 @@ class PhairPlayService : Service() {
      * receivers according to the enabled flags.
      */
     private suspend fun startReceivers() {
+        if (!hasUsableNetwork()) {
+            waitingForNetwork = true
+            _serviceState.value = ServiceState.Running
+            updateNotification(
+                isRunning = true,
+                notificationContentText = getString(R.string.notification_status_waiting_network)
+            )
+            Logger.w("No Wi-Fi/Ethernet network available — receivers will start when network returns")
+            return
+        }
+
+        waitingForNetwork = false
         val settings = settingsRepository.settingsFlow.first()
         Logger.i("Starting receivers: AirPlay=${settings.airPlayEnabled}, Miracast=${settings.miracastEnabled}, Cast=${settings.castEnabled}")
 
@@ -195,6 +254,7 @@ class PhairPlayService : Service() {
     private fun stopReceivers() {
         Logger.i("Stopping all receivers")
         stopAllReceiversInternal()
+        waitingForNetwork = false
         _serviceState.value = ServiceState.Stopped
         _activeConnection.value = null
         updateNotification(isRunning = false)
@@ -211,6 +271,93 @@ class PhairPlayService : Service() {
         stopAllReceiversInternal()
         kotlinx.coroutines.delay(500) // brief pause to ensure ports are released
         startReceivers()
+    }
+
+    // ─── Network recovery ───────────────────────────────────────────────────
+
+    /**
+     * Watches Wi-Fi/Ethernet independently of the Activity. On a real network loss we close the
+     * current RTSP/P2P sockets and media decoders; when a usable network returns, fresh mDNS and
+     * listening sockets are created. A sender may still need to retry AirPlay, but the receiver is
+     * ready and visible again without reopening the app.
+     */
+    private fun registerNetworkMonitoring() {
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+            .build()
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onLost(network: Network) {
+                if (!receiverRunRequested) return
+                Logger.w("Network lost: $network — scheduling receiver recovery")
+                waitingForNetwork = true
+                scheduleNetworkReconcile()
+            }
+
+            override fun onAvailable(network: Network) {
+                if (!receiverRunRequested) return
+                Logger.i("Network available: $network — scheduling receiver recovery")
+                scheduleNetworkReconcile()
+            }
+        }
+        try {
+            connectivityManager.registerNetworkCallback(request, callback)
+            networkCallback = callback
+        } catch (e: Exception) {
+            // The receiver still works on devices with unusual/OEM connectivity managers; this
+            // only disables automatic recovery and leaves the explicit Restart action available.
+            Logger.e("Unable to register network recovery callback", e)
+        }
+    }
+
+    private fun unregisterNetworkMonitoring() {
+        networkCallback?.let { callback ->
+            runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
+    }
+
+    private fun scheduleNetworkReconcile() {
+        networkRecoveryJob?.cancel()
+        networkRecoveryJob = serviceScope.launch {
+            delay(NETWORK_RECONCILE_DELAY_MS)
+            if (!receiverRunRequested) return@launch
+
+            receiverMutex.withLock {
+                if (!hasUsableNetwork()) {
+                    if (hasAnyReceiver()) {
+                        Logger.w("Network is still unavailable — stopping receivers until it returns")
+                        stopAllReceiversInternal()
+                    }
+                    waitingForNetwork = true
+                    updateNotification(
+                        isRunning = true,
+                        notificationContentText = getString(R.string.notification_status_waiting_network)
+                    )
+                    return@withLock
+                }
+
+                // A lost network invalidates the old mDNS registrations and sockets even when the
+                // OS reports a new network before the debounce expires. Recreate all receivers so
+                // the new interface/IP is advertised correctly.
+                if (waitingForNetwork) {
+                    Logger.i("Network restored — restarting receivers and mDNS")
+                    stopAllReceiversInternal()
+                    delay(NETWORK_RESTART_DELAY_MS)
+                    startReceivers()
+                }
+            }
+        }
+    }
+
+    private fun hasAnyReceiver(): Boolean =
+        airPlayReceiver != null || miracastReceiver != null || castReceiver != null
+
+    /** Returns true for a usable local Wi-Fi or Ethernet link; internet validation is not required. */
+    private fun hasUsableNetwork(): Boolean = connectivityManager.allNetworks.any { network ->
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return@any false
+        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
     }
 
     // ─── Individual Protocol Starters ────────────────────────────────────────
@@ -281,6 +428,10 @@ class PhairPlayService : Service() {
                         _activeConnection.value =
                             ActiveConnection(pendingSenderName, Protocol.AIRPLAY)
                         updateNotification(isRunning = true, streamingSenderName = pendingSenderName)
+                        // When the receiver was started on boot, no Activity may exist yet. Bring
+                        // the TV streaming surface forward as soon as a sender connects so video
+                        // has a real Surface to render into without requiring a manual app launch.
+                        bringStreamingActivityToFront()
                     }
                     ProtocolState.ADVERTISING,
                     ProtocolState.DISABLED,
@@ -395,12 +546,35 @@ class PhairPlayService : Service() {
             .build()
     }
 
-    private fun updateNotification(isRunning: Boolean, streamingSenderName: String? = null) {
-        val contentText = streamingSenderName?.let {
+    private fun updateNotification(
+        isRunning: Boolean,
+        streamingSenderName: String? = null,
+        notificationContentText: String? = null
+    ) {
+        val contentText = notificationContentText ?: streamingSenderName?.let {
             getString(R.string.notification_status_streaming, it)
         }
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(NOTIFICATION_ID, buildNotification(isRunning, contentText))
+    }
+
+    /** Opens/reuses the TV Activity when a sender connects while the UI was not open. */
+    private fun bringStreamingActivityToFront() {
+        serviceScope.launch(Dispatchers.Main.immediate) {
+            try {
+                startActivity(Intent(this@PhairPlayService, MainActivity::class.java).apply {
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    )
+                })
+            } catch (e: Exception) {
+                // Some OEM launchers block background Activity starts. The receiver remains alive;
+                // opening the persistent notification will still provide the rendering surface.
+                Logger.w("Could not bring streaming Activity to front: ${e.message}")
+            }
+        }
     }
 
     // ─── Binder ─────────────────────────────────────────────────────────────
@@ -422,6 +596,8 @@ class PhairPlayService : Service() {
         const val ACTION_START    = "com.phairplay.action.START"
         const val ACTION_STOP     = "com.phairplay.action.STOP"
         const val ACTION_RESTART  = "com.phairplay.action.RESTART"
+        private const val NETWORK_RECONCILE_DELAY_MS = 1_000L
+        private const val NETWORK_RESTART_DELAY_MS = 500L
     }
 }
 

@@ -134,17 +134,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // A user-initiated exit (Back out of the app) should end any active mirror — closing the
-        // service stops the receiver, which drops the RTSP connection so the sender stops mirroring
-        // too. isFinishing distinguishes a real exit from a config-change recreation (where the
-        // service must keep running). Backgrounding via Home goes through onStop only (no destroy),
-        // so the receiver keeps advertising for a quick return.
-        if (isFinishing) {
-            Timber.d("MainActivity finishing — stopping service so mirroring doesn't linger")
-            ServiceController.stop(this)
-        } else {
-            Timber.d("MainActivity destroyed (recreation) — leaving service running")
-        }
+        // The receiver is a foreground service and must outlive the UI. Back/Home, task removal,
+        // and Activity recreation must not stop AirPlay advertising or an active mirror. The
+        // explicit Stop action in the service notification/Home screen remains the only normal way
+        // to stop the receiver.
+        Timber.d("MainActivity destroyed — leaving PhairPlayService running")
     }
 
     // ─── View Setup ──────────────────────────────────────────────────────────

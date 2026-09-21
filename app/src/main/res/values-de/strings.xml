@@ -47,6 +47,7 @@
     <string name="notification_channel_description">Benachrichtigung für den AirPlay/Miracast/Cast-Empfänger-Dienst</string>
     <string name="notification_status_running">Empfänger aktiv — Werbung im Netzwerk</string>
     <string name="notification_status_stopped">Empfänger gestoppt</string>
+    <string name="notification_status_waiting_network">Warte auf WLAN/Ethernet — automatische Wiederverbindung</string>
 
     <!-- ── Settings section headers ────────────────────────────── -->
     <string name="settings_section_display">Anzeige</string>

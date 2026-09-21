@@ -59,10 +59,11 @@ data class AppSettings(
 
     // ─── Service behavior ──────────────────────────────────────────────────
     /**
-     * Whether PhairPlayService starts automatically on device boot.
+     * Whether the receiver service starts automatically after the TV boots.
+     * Enabled by default so AirPlay is available even when the UI has not been opened.
      * Requires the RECEIVE_BOOT_COMPLETED permission to be effective.
      */
-    val startOnBoot: Boolean = false,
+    val startOnBoot: Boolean = true,
 
     // ─── Developer / Debug ─────────────────────────────────────────────────
     /**
@@ -89,7 +90,7 @@ data class AppSettings(
      * the whole mirror session down after a couple of seconds — so this defaults OFF to keep video
      * mirroring rock-solid. Turn on to experiment with audio.
      */
-    val mirrorAudioEnabled: Boolean = true
+    val mirrorAudioEnabled: Boolean = false
 ) {
 
     /** Advertised mirroring display size: 2560×1440 when [forceHighResolution], else 1920×1080. */

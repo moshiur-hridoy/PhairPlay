@@ -58,6 +58,7 @@
     <string name="notification_channel_description">Persistent notification for the AirPlay/Miracast/Cast receiver service</string>
     <string name="notification_status_running">Receiver active — advertising on network</string>
     <string name="notification_status_stopped">Receiver stopped</string>
+    <string name="notification_status_waiting_network">Waiting for Wi-Fi/Ethernet — will reconnect automatically</string>
     <!-- %1$s = sender device name -->
     <string name="notification_status_streaming">Streaming from %1$s</string>
 
